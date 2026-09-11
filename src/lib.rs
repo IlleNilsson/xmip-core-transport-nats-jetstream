@@ -33,10 +33,12 @@ use std::time::Duration;
 
 pub use client::JetStream;
 pub use session::{Event, Session};
-use transport::error::Result;
+use transport::error::{Result, protocol_error};
+use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Directions, Transport};
 
+#[derive(Clone)]
 pub struct JetStreamTransport {
     server: String,
     stream: String,
@@ -163,6 +165,59 @@ impl Transport for JetStreamTransport {
         let (server, subject) = self.resolve(target);
         let mut client = JetStream::connect(server, &self.name, self.timeout)?;
         client.publish(subject, bytes).map(|_| ())
+    }
+}
+
+impl JetStreamTransport {
+    /// Both ends on this machine: an ephemeral local port, the loopback
+    /// timeout, one stream called `probe` over one subject called `probe`.
+    #[must_use]
+    pub fn loopback() -> Self {
+        Self::new("127.0.0.1:0", "probe", "probe").timing_out_after(LOOPBACK_TIMEOUT)
+    }
+}
+
+/// A bound listener serving one stream, waiting for its one client and its
+/// one publish.
+struct Listening {
+    transport: JetStreamTransport,
+    listener: TcpListener,
+    address: String,
+}
+
+impl FarEnd for Listening {
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn take_one(self: Box<Self>) -> Result<Arrived> {
+        let mut session = self.transport.accept_one(&self.listener)?;
+        // The acknowledgement goes out before the publish is reported, so
+        // the client has its sequence by the time this returns.
+        session
+            .next_publish()?
+            .ok_or_else(|| protocol_error("the client closed without publishing"))
+    }
+}
+
+impl Loopback for JetStreamTransport {
+    fn far_end(&self) -> Result<Box<dyn FarEnd>> {
+        let (listener, address) = self.bind()?;
+        Ok(Box::new(Listening {
+            transport: self.clone(),
+            listener,
+            address,
+        }))
+    }
+
+    /// A fresh client to `address`, publishing on this transport's subject
+    /// and waiting for the stream's acknowledgement by sequence.
+    fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
+        Self {
+            server: address.to_string(),
+            ..self.clone()
+        }
+        .send(&self.subject, payload)
     }
 }
 
@@ -309,5 +364,55 @@ mod tests {
         assert!(!near.connect().err().expect("not nats").retryable);
         assert!(near.claims().is_none());
         assert_eq!(near.name(), "nats-jetstream");
+    }
+
+    #[test]
+    fn the_loopback_round_returns_the_payload_and_its_origin() {
+        let loopback = JetStreamTransport::loopback();
+        let arrived = loopback.round(b"pub\r\nlished").expect("round");
+        assert_eq!(arrived.bytes, b"pub\r\nlished");
+        assert!(
+            arrived
+                .origin_uri
+                .starts_with("nats-jetstream://127.0.0.1:")
+        );
+        assert!(arrived.origin_uri.ends_with("/probe/probe?seq=1"));
+        assert!(loopback.ceiling().is_none());
+        assert!(loopback.refuses(b"anything").is_none());
+    }
+
+    #[test]
+    fn the_loopback_returns_the_edge_payloads_whole() {
+        let loopback = JetStreamTransport::loopback();
+        for (name, payload) in edge_payloads() {
+            let arrived = loopback.round(&payload).expect(name);
+            assert!(arrived.bytes == payload, "{name} came back changed");
+        }
+    }
+
+    /// The Playground's edge payloads, written here so the crate does not
+    /// depend on it: the shapes a framing fault changes.
+    fn edge_payloads() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("empty", Vec::new()),
+            ("one byte", vec![0x2a]),
+            ("every byte", (0..=255).collect()),
+            ("nul run", vec![0; 512]),
+            ("high bytes", vec![0xff; 512]),
+            ("crlf storm", b"\r\n".repeat(400)),
+            ("mtu minus one", patterned(1_471)),
+            ("mtu", patterned(1_472)),
+            ("mtu plus one", patterned(1_473)),
+            ("udp maximum", patterned(65_507)),
+            ("sixteen bits plus one", patterned(65_537)),
+            ("a mebibyte", patterned(1 << 20)),
+        ]
+    }
+
+    /// `len` bytes a truncation, a reorder or a duplicate would change.
+    fn patterned(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|at| u8::try_from((at * 31 + at / 251) % 256).unwrap_or(0))
+            .collect()
     }
 }
