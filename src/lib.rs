@@ -34,6 +34,7 @@ use std::time::Duration;
 pub use client::JetStream;
 pub use session::{Event, Session};
 use transport::error::{Result, protocol_error};
+use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Directions, Transport};
@@ -177,21 +178,9 @@ impl JetStreamTransport {
     }
 }
 
-/// A bound listener serving one stream, waiting for its one client and its
-/// one publish.
-struct Listening {
-    transport: JetStreamTransport,
-    listener: TcpListener,
-    address: String,
-}
-
-impl FarEnd for Listening {
-    fn address(&self) -> &str {
-        &self.address
-    }
-
-    fn take_one(self: Box<Self>) -> Result<Arrived> {
-        let mut session = self.transport.accept_one(&self.listener)?;
+impl Accepting for JetStreamTransport {
+    fn take_one(&self, listener: &TcpListener) -> Result<Arrived> {
+        let mut session = self.accept_one(listener)?;
         // The acknowledgement goes out before the publish is reported, so
         // the client has its sequence by the time this returns.
         session
@@ -203,11 +192,7 @@ impl FarEnd for Listening {
 impl Loopback for JetStreamTransport {
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         let (listener, address) = self.bind()?;
-        Ok(Box::new(Listening {
-            transport: self.clone(),
-            listener,
-            address,
-        }))
+        Ok(Box::new(Listening::new(self.clone(), listener, address)))
     }
 
     /// A fresh client to `address`, publishing on this transport's subject
@@ -224,6 +209,7 @@ impl Loopback for JetStreamTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use transport::payload::{edge_payloads, sized_payloads};
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
@@ -384,35 +370,9 @@ mod tests {
     #[test]
     fn the_loopback_returns_the_edge_payloads_whole() {
         let loopback = JetStreamTransport::loopback();
-        for (name, payload) in edge_payloads() {
+        for (name, payload) in [edge_payloads(), sized_payloads()].concat() {
             let arrived = loopback.round(&payload).expect(name);
             assert!(arrived.bytes == payload, "{name} came back changed");
         }
-    }
-
-    /// The Playground's edge payloads, written here so the crate does not
-    /// depend on it: the shapes a framing fault changes.
-    fn edge_payloads() -> Vec<(&'static str, Vec<u8>)> {
-        vec![
-            ("empty", Vec::new()),
-            ("one byte", vec![0x2a]),
-            ("every byte", (0..=255).collect()),
-            ("nul run", vec![0; 512]),
-            ("high bytes", vec![0xff; 512]),
-            ("crlf storm", b"\r\n".repeat(400)),
-            ("mtu minus one", patterned(1_471)),
-            ("mtu", patterned(1_472)),
-            ("mtu plus one", patterned(1_473)),
-            ("udp maximum", patterned(65_507)),
-            ("sixteen bits plus one", patterned(65_537)),
-            ("a mebibyte", patterned(1 << 20)),
-        ]
-    }
-
-    /// `len` bytes a truncation, a reorder or a duplicate would change.
-    fn patterned(len: usize) -> Vec<u8> {
-        (0..len)
-            .map(|at| u8::try_from((at * 31 + at / 251) % 256).unwrap_or(0))
-            .collect()
     }
 }
