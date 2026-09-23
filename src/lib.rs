@@ -16,7 +16,7 @@
 //! `$JS.API.*` subjects with JSON bodies, and delivery is a MSG whose reply
 //! subject is where the acknowledgement goes — so this sits on the nats
 //! technology's wire. Headers are not spoken: a pull that expires is silent
-//! and the read timeout ends the batch. TLS is the transport capability's,
+//! and the read timeout ends the batch. TLS is `xmip-core-tls`'s,
 //! per ADR-0033.
 //!
 //! The origin URI carries what the delivery knew:
