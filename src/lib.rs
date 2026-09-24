@@ -179,7 +179,7 @@ impl JetStreamTransport {
 }
 
 impl Accepting for JetStreamTransport {
-    fn take_one(&self, listener: &TcpListener) -> Result<Arrived> {
+    fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
         let mut session = self.accept_one(listener)?;
         // The acknowledgement goes out before the publish is reported, so
         // the client has its sequence by the time this returns.
@@ -191,8 +191,7 @@ impl Accepting for JetStreamTransport {
 
 impl Loopback for JetStreamTransport {
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
-        let (listener, address) = self.bind()?;
-        Ok(Box::new(Listening::new(self.clone(), listener, address)))
+        Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }
 
     /// A fresh client to `address`, publishing on this transport's subject
