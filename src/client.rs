@@ -3,28 +3,26 @@
 //! acknowledgement, a pull that takes a batch, and the acknowledgement of
 //! each message taken.
 //!
-//! This sits on the nats technology's wire rather than on its `Client`,
-//! because a request needs a reply subject on the PUB and the reply subject
-//! off the MSG, and core NATS at-most-once has no use for either.
+//! The connection is the nats technology's [`nats::Client`]: its connect,
+//! INFO and CONNECT, its lines, its pings answered. What is here is the
+//! request and reply `JetStream` speaks over it — a reply subject on the
+//! PUB, and the MSG that answers on it.
 
 use std::collections::BTreeMap;
-use std::io::{BufReader, Write};
-use std::net::TcpStream;
 use std::time::Duration;
 
 use codec::{hex, random};
-use nats::wire::{Line, encode, read};
-use serde_json::{Value, json};
+use nats::Client;
+use nats::wire::Line;
+use serde_json::Value;
 use transport::Arrived;
-use transport::error::{Result, TransportError, classify, protocol_error};
-use transport::socket;
+use transport::error::{Result, TransportError, protocol_error};
+use transport::pool::Pooled;
 
 use crate::api::{self, Answer};
 
 pub struct JetStream {
-    reader: BufReader<TcpStream>,
-    writer: TcpStream,
-    server: String,
+    client: Client,
     inbox: String,
     requests: u64,
     /// Where each message fetched and not yet acknowledged is acknowledged,
@@ -33,46 +31,32 @@ pub struct JetStream {
 }
 
 impl JetStream {
-    /// Connect to `server`, take its INFO, answer with CONNECT and listen on
+    /// Connect to `server` as a NATS client presenting `name`, and listen on
     /// an inbox of this connection's own.
     ///
     /// # Errors
     /// Where the server could not be reached, did not open with INFO, or
     /// does not run `JetStream`.
     pub fn connect(server: &str, name: &str, timeout: Option<Duration>) -> Result<Self> {
-        let stream = socket::connect_tcp(server, timeout)?;
-        let (reader, writer) = socket::split(stream)?;
-        let mut client = Self {
-            reader,
-            writer,
-            server: server.to_string(),
-            inbox: format!("{}.{}", api::INBOX, hex::encode(&random::array::<16>())),
-            requests: 0,
-            pending: BTreeMap::new(),
-        };
-        let Some(Line::Info(info)) = read(&mut client.reader)? else {
-            return Err(protocol_error("the server did not open with INFO"));
-        };
-        let info: Value = serde_json::from_str(&info)
+        let client = Client::connect(server, name, timeout)?;
+        let info: Value = serde_json::from_str(client.info())
             .map_err(|e| protocol_error(format!("an INFO that is not JSON: {e}")))?;
         if info.get("jetstream").and_then(Value::as_bool) != Some(true) {
             return Err(protocol_error("the server does not run JetStream"));
         }
-        let connect = json!({
-            "verbose": false,
-            "pedantic": false,
-            "headers": false,
-            "name": name,
-            "lang": "rust",
-            "version": "0.1.0",
-        });
-        client.write(&Line::Connect(connect.to_string()))?;
-        client.write(&Line::Sub {
-            subject: format!("{}.*", client.inbox),
+        let mut jetstream = Self {
+            client,
+            inbox: format!("{}.{}", api::INBOX, hex::encode(&random::array::<16>())),
+            requests: 0,
+            pending: BTreeMap::new(),
+        };
+        let inbox = format!("{}.*", jetstream.inbox);
+        jetstream.client.write(&Line::Sub {
+            subject: inbox,
             queue: None,
             sid: "1".to_string(),
         })?;
-        Ok(client)
+        Ok(jetstream)
     }
 
     /// The stream, created over `subjects` where it is not there.
@@ -118,7 +102,7 @@ impl JetStream {
     /// the server refused the message.
     pub fn publish(&mut self, subject: &str, bytes: &[u8]) -> Result<u64> {
         let reply = self.next_reply();
-        self.write(&Line::Pub {
+        self.client.write(&Line::Pub {
             subject: subject.to_string(),
             reply: Some(reply.clone()),
             payload: bytes.to_vec(),
@@ -148,22 +132,16 @@ impl JetStream {
     /// reported an error.
     pub fn fetch(&mut self, stream: &str, consumer: &str, batch: usize) -> Result<Vec<Arrived>> {
         let reply = self.next_reply();
-        let expires = self
-            .reader
-            .get_ref()
-            .read_timeout()
-            .ok()
-            .flatten()
-            .map(|t| t.mul_f32(0.9));
+        let expires = self.client.read_timeout().map(|t| t.mul_f32(0.9));
         let request = api::next_request(batch, expires);
-        self.write(&Line::Pub {
+        self.client.write(&Line::Pub {
             subject: api::msg_next(stream, consumer),
             reply: Some(reply),
             payload: request.to_string().into_bytes(),
         })?;
         let mut arrived = Vec::new();
         while arrived.len() < batch {
-            match self.next_line() {
+            match self.client.next_line() {
                 Ok(Some(Line::Msg {
                     subject,
                     reply: Some(ack),
@@ -173,7 +151,7 @@ impl JetStream {
                     let seq = api::stream_seq_of(&ack).unwrap_or(0);
                     let origin = format!(
                         "nats-jetstream://{}/{stream}/{subject}?seq={seq}",
-                        self.server
+                        self.client.server()
                     );
                     self.pending.insert(origin.clone(), ack);
                     arrived.push(Arrived::new(origin, payload));
@@ -200,7 +178,7 @@ impl JetStream {
                 arrived.origin_uri
             ))
         })?;
-        self.write(&Line::Pub {
+        self.client.write(&Line::Pub {
             subject,
             reply: None,
             payload: api::ACK.to_vec(),
@@ -213,14 +191,7 @@ impl JetStream {
     /// # Errors
     /// Where the server went away or answered with an error.
     pub fn flush(&mut self) -> Result<()> {
-        self.write(&Line::Ping)?;
-        loop {
-            match self.next_line()? {
-                Some(Line::Pong) => return Ok(()),
-                Some(_) => {}
-                None => return Err(protocol_error("the server closed before PONG")),
-            }
-        }
+        self.client.flush()
     }
 
     /// One API request and its answer.
@@ -231,7 +202,7 @@ impl JetStream {
         } else {
             body.to_string().into_bytes()
         };
-        self.write(&Line::Pub {
+        self.client.write(&Line::Pub {
             subject: subject.to_string(),
             reply: Some(reply.clone()),
             payload,
@@ -243,7 +214,7 @@ impl JetStream {
     /// way is ignored.
     fn wait_for(&mut self, reply: &str) -> Result<Vec<u8>> {
         loop {
-            match self.next_line()? {
+            match self.client.next_line()? {
                 Some(Line::Msg {
                     subject, payload, ..
                 }) if subject == reply => return Ok(payload),
@@ -253,28 +224,15 @@ impl JetStream {
         }
     }
 
-    /// The next line, pings answered and errors raised.
-    fn next_line(&mut self) -> Result<Option<Line>> {
-        loop {
-            match read(&mut self.reader)? {
-                Some(Line::Ping) => self.write(&Line::Pong)?,
-                Some(Line::Err(message)) => return Err(protocol_error(message)),
-                other => return Ok(other),
-            }
-        }
-    }
-
     fn next_reply(&mut self) -> String {
         self.requests += 1;
         format!("{}.{}", self.inbox, self.requests)
     }
+}
 
-    fn write(&mut self, line: &Line) -> Result<()> {
-        self.writer
-            .write_all(&encode(line))
-            .map_err(|e| classify("writing a protocol line", &e))?;
-        self.writer
-            .flush()
-            .map_err(|e| classify("flushing a protocol line", &e))
+impl Pooled for JetStream {
+    /// While the server has not closed the connection.
+    fn usable(&mut self) -> bool {
+        self.client.usable()
     }
 }
