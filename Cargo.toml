@@ -24,6 +24,9 @@ transport = { package = "xmip-core-transport", git = "https://github.com/IlleNil
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
 nats = { package = "xmip-core-transport-nats", git = "https://github.com/IlleNilsson/xmip-core-transport-nats", branch = "main" }
 serde_json = "1"
+# The inbox this connection listens on is named from random bytes, spelled
+# in hex (codec's `random` and `hex`).
+codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main" }
 
 [dev-dependencies]
 # The loopback payloads the tests drive, from the capability's test
