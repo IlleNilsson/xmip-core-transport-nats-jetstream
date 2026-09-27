@@ -33,11 +33,19 @@ use std::time::Duration;
 
 pub use client::JetStream;
 pub use session::{Event, Session};
+use transport::error::TransportError;
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Directions, Transport};
+use transport::{Arrived, Configured, Directions, Transport};
+use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+
+/// The durable consumer a Location pulls as unless told otherwise.
+pub const DEFAULT_CONSUMER: &str = "xmip";
+
+/// How many messages one receive pulls at most unless told otherwise.
+pub const DEFAULT_BATCH: usize = 10;
 
 #[derive(Clone)]
 pub struct JetStreamTransport {
@@ -63,9 +71,9 @@ impl JetStreamTransport {
             server: server.into(),
             stream: stream.into(),
             subject: subject.into(),
-            consumer: "xmip".to_string(),
-            name: "xmip".to_string(),
-            batch: 10,
+            consumer: DEFAULT_CONSUMER.to_string(),
+            name: nats::DEFAULT_NAME.to_string(),
+            batch: DEFAULT_BATCH,
             timeout: None,
         }
     }
@@ -169,6 +177,86 @@ impl Transport for JetStreamTransport {
     }
 }
 
+impl Configured for JetStreamTransport {
+    /// The address is the server's host and port: where a Location connects.
+    // DEFAULT_BATCH is ten, which no pointer width wraps.
+    #[allow(clippy::cast_possible_wrap)]
+    const SETTINGS: &'static Settings = &Settings {
+        technology: env!("CARGO_PKG_NAME"),
+        settings: &[
+            Setting {
+                name: "stream",
+                kind: Kind::Text,
+                presence: Presence::Required,
+                meaning: "The stream a Receive Location makes sure of and pulls from.",
+                applies: Applies::Receive,
+            },
+            Setting {
+                name: "subject",
+                kind: Kind::Text,
+                presence: Presence::Required,
+                meaning: "The subject the stream covers, and the one a Send Location \
+                          publishes on when its target names none.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "consumer",
+                kind: Kind::Text,
+                presence: Presence::Default(Fixed::Text(DEFAULT_CONSUMER)),
+                meaning: "The durable consumer a Receive Location pulls as; two Locations \
+                          with one name share one place in the stream.",
+                applies: Applies::Receive,
+            },
+            Setting {
+                name: "batch",
+                kind: Kind::Integer {
+                    minimum: 1,
+                    maximum: u32::MAX as i64,
+                },
+                presence: Presence::Default(Fixed::Integer(DEFAULT_BATCH as i64)),
+                meaning: "How many messages one receive pulls at most.",
+                applies: Applies::Receive,
+            },
+            Setting {
+                name: "name",
+                kind: Kind::Text,
+                presence: Presence::Default(Fixed::Text(nats::DEFAULT_NAME)),
+                meaning: "The name a Location presents to the server in CONNECT.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "timeout",
+                kind: Kind::Duration,
+                presence: Presence::Optional,
+                meaning: "How long a server that stops mid-line is waited on, and how long \
+                          a quiet server ends a batch; unbounded when left out.",
+                applies: Applies::Both,
+            },
+        ],
+    };
+
+    fn configured(address: &str, settings: &Read) -> Result<Self> {
+        let stream = settings.optional_text("stream").unwrap_or_default();
+        let mut transport =
+            Self::new(address, stream, settings.text("subject")).named(settings.text("name"));
+        if let Some(consumer) = settings.optional_text("consumer") {
+            transport = transport.as_consumer(consumer);
+        }
+        if let Some(batch) = settings.optional_integer("batch") {
+            let batch = usize::try_from(batch).map_err(|_| {
+                TransportError::permanent(format!(
+                    "a batch of {batch} is more than this system holds"
+                ))
+            })?;
+            transport = transport.in_batches_of(batch);
+        }
+        if let Some(timeout) = settings.optional_duration("timeout") {
+            transport = transport.timing_out_after(timeout);
+        }
+        Ok(transport)
+    }
+}
+
 impl JetStreamTransport {
     /// Both ends on this machine: an ephemeral local port, the loopback
     /// timeout, one stream called `probe` over one subject called `probe`.
@@ -216,6 +304,38 @@ mod tests {
 
     fn far_end() -> JetStreamTransport {
         JetStreamTransport::new("127.0.0.1:0", "orders", "orders.*").timing_out_after(secs(2))
+    }
+
+    #[test]
+    fn nats_jetstream_declares_its_settings_and_reads_through_them() {
+        use xcore::settings::Given;
+        assert_eq!(
+            JetStreamTransport::SETTINGS.problems(),
+            Vec::<String>::new()
+        );
+        let text = |name: &str, value: &str| (name.to_string(), Given::Text(value.to_string()));
+        let given = [
+            text("stream", "orders"),
+            text("subject", "orders.*"),
+            ("batch".to_string(), Given::Integer(25)),
+            text("timeout", "2s"),
+        ];
+        let built = JetStreamTransport::open("bus:4222", Applies::Receive, &given).expect("built");
+        assert_eq!(built.stream, "orders");
+        assert_eq!(built.subject, "orders.*");
+        assert_eq!(built.consumer, DEFAULT_CONSUMER);
+        assert_eq!(built.batch, 25);
+        assert_eq!(built.timeout, Some(secs(2)));
+        let sent = JetStreamTransport::open("bus:4222", Applies::Send, &given[1..2]);
+        assert_eq!(sent.expect("built").batch, DEFAULT_BATCH);
+        let Err(refused) = JetStreamTransport::open("bus:4222", Applies::Send, &given) else {
+            panic!("stream is a receive setting");
+        };
+        assert!(
+            refused.message.contains("\"stream\""),
+            "{}",
+            refused.message
+        );
     }
 
     #[test]
