@@ -38,7 +38,7 @@ use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Configured, Directions, Transport};
+use transport::{Arrived, Configured, Directions, Pool, Transport};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 /// The durable consumer a Location pulls as unless told otherwise.
@@ -56,6 +56,9 @@ pub struct JetStreamTransport {
     name: String,
     batch: usize,
     timeout: Option<Duration>,
+    /// The connections a send publishes on, connected once per server and
+    /// kept.
+    publishers: Pool<JetStream>,
 }
 
 impl JetStreamTransport {
@@ -75,6 +78,7 @@ impl JetStreamTransport {
             name: nats::DEFAULT_NAME.to_string(),
             batch: DEFAULT_BATCH,
             timeout: None,
+            publishers: Pool::new(),
         }
     }
 
@@ -169,11 +173,15 @@ impl Transport for JetStreamTransport {
         Ok(arrived)
     }
 
-    /// Publish and wait for the stream's acknowledgement.
+    /// Publish on the connection kept for the server, connected on the
+    /// first send to it, and wait for the stream's acknowledgement.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
         let (server, subject) = self.resolve(target);
-        let mut client = JetStream::connect(server, &self.name, self.timeout)?;
-        client.publish(subject, bytes).map(|_| ())
+        self.publishers.exchange(
+            server,
+            || JetStream::connect(server, &self.name, self.timeout),
+            |client| client.publish(subject, bytes).map(|_| ()),
+        )
     }
 }
 
@@ -358,10 +366,9 @@ mod tests {
         let first = session.next_publish().expect("first").expect("one");
         assert_eq!(first.bytes, b"order 1\r\nline 2");
         assert!(first.origin_uri.ends_with("/orders/orders.new?seq=1"));
-        assert!(session.next_publish().expect("closed").is_none());
-        let mut session = far_end.accept_one(&listener).expect("second");
+        // The same server, so the same connection: connected once.
         let second = session.next_publish().expect("second").expect("one");
-        assert!(second.origin_uri.ends_with("/orders/orders.cancel?seq=1"));
+        assert!(second.origin_uri.ends_with("/orders/orders.cancel?seq=2"));
         assert!(second.bytes.is_empty());
         let mut session = far_end.accept_one(&listener).expect("third");
         assert_eq!(
@@ -377,6 +384,38 @@ mod tests {
         let error = refused.expect_err("no stream took it");
         assert!(error.retryable);
         assert!(error.message.contains("no stream acknowledged"));
+    }
+
+    #[test]
+    fn a_thousand_publishes_connect_once_and_a_connection_the_server_closed_is_replaced() {
+        const SENDS: usize = 1000;
+        let far_end = far_end().timing_out_after(secs(5));
+        let (listener, address) = far_end.bind().expect("binding");
+        let near =
+            JetStreamTransport::new(address, "orders", "orders.new").timing_out_after(secs(5));
+        let sending = near.clone();
+        let sender = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            for n in 0..SENDS {
+                sending.send("orders.new", n.to_string().as_bytes())?;
+            }
+            let took = began.elapsed();
+            // Generous for a debug build under load: a millisecond a publish.
+            assert!(took < Duration::from_millis(SENDS as u64), "{took:?}");
+            sending.send("orders.new", b"after the close")
+        });
+        // One CONNECT for every publish: one session accepted.
+        let mut session = far_end.accept_one(&listener).expect("accepting");
+        for n in 0..SENDS {
+            let arrived = session.next_publish().expect("publish").expect("one");
+            assert_eq!(arrived.bytes, n.to_string().as_bytes());
+        }
+        drop(session);
+        let mut again = far_end.accept_one(&listener).expect("a new connection");
+        let last = again.next_publish().expect("publish").expect("one");
+        assert_eq!(last.bytes, b"after the close");
+        sender.join().expect("thread").expect("sending");
+        assert_eq!(near.publishers.opened(), 2);
     }
 
     #[test]
