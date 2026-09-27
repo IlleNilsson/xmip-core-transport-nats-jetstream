@@ -10,8 +10,9 @@
 use std::collections::BTreeMap;
 use std::io::{BufReader, Write};
 use std::net::TcpStream;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use codec::{hex, random};
 use nats::wire::{Line, encode, read};
 use serde_json::{Value, json};
 use transport::Arrived;
@@ -41,14 +42,11 @@ impl JetStream {
     pub fn connect(server: &str, name: &str, timeout: Option<Duration>) -> Result<Self> {
         let stream = socket::connect_tcp(server, timeout)?;
         let (reader, writer) = socket::split(stream)?;
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
         let mut client = Self {
             reader,
             writer,
             server: server.to_string(),
-            inbox: format!("{}.{unique:x}", api::INBOX),
+            inbox: format!("{}.{}", api::INBOX, hex::encode(&random::array::<16>())),
             requests: 0,
             pending: BTreeMap::new(),
         };
