@@ -32,6 +32,7 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 pub use client::JetStream;
+use net::Target;
 pub use session::{Event, Session};
 use transport::error::TransportError;
 use transport::error::{Result, protocol_error};
@@ -42,10 +43,10 @@ use transport::{Arrived, Configured, Directions, Pool, Transport};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 /// The durable consumer a Location pulls as unless told otherwise.
-pub const DEFAULT_CONSUMER: &str = "xmip";
+const DEFAULT_CONSUMER: &str = "xmip";
 
 /// How many messages one receive pulls at most unless told otherwise.
-pub const DEFAULT_BATCH: usize = 10;
+const DEFAULT_BATCH: usize = 10;
 
 #[derive(Clone)]
 pub struct JetStreamTransport {
@@ -59,6 +60,9 @@ pub struct JetStreamTransport {
     /// The connections a send publishes on, connected once per server and
     /// kept.
     publishers: Pool<JetStream>,
+    /// The connection a receive pulls on, its stream and consumer made sure
+    /// of on the first receive and kept.
+    consumers: Pool<JetStream>,
 }
 
 impl JetStreamTransport {
@@ -79,6 +83,7 @@ impl JetStreamTransport {
             batch: DEFAULT_BATCH,
             timeout: None,
             publishers: Pool::new(),
+            consumers: Pool::new(),
         }
     }
 
@@ -99,7 +104,7 @@ impl JetStreamTransport {
 
     /// How many messages one receive pulls at most.
     #[must_use]
-    pub const fn in_batches_of(mut self, batch: usize) -> Self {
+    const fn in_batches_of(mut self, batch: usize) -> Self {
         self.batch = batch;
         self
     }
@@ -140,13 +145,10 @@ impl JetStreamTransport {
     /// Where a target names the server and subject itself, or is a subject
     /// alone on this transport's server.
     fn resolve<'a>(&'a self, target: &'a str) -> (&'a str, &'a str) {
-        match socket::target("nats-jetstream", target) {
-            Some((peer, "")) => (peer, &self.subject),
-            Some(pair) => pair,
-            None => match target.split_once('/') {
-                Some((peer, subject)) if peer.contains(':') => (peer, subject),
-                _ => (&self.server, target),
-            },
+        match Target::naming_server(&["nats-jetstream"], target) {
+            Some(named) if named.path().is_empty() => (named.authority(), &self.subject),
+            Some(named) => (named.authority(), named.path()),
+            None => (&self.server, target),
         }
     }
 }
@@ -160,17 +162,26 @@ impl Transport for JetStreamTransport {
         Directions::BOTH
     }
 
-    /// Make sure the stream and consumer exist, pull one batch, acknowledge
-    /// each message.
+    /// Pull one batch and acknowledge each message, on the connection the
+    /// first receive opened and made sure of the stream and consumer on,
+    /// and kept.
     fn receive(&self) -> Result<Vec<Arrived>> {
-        let mut client = self.connect()?;
-        client.ensure_stream(&self.stream, &[&self.subject])?;
-        client.ensure_consumer(&self.stream, &self.consumer)?;
-        let arrived = client.fetch(&self.stream, &self.consumer, self.batch)?;
-        for message in &arrived {
-            client.ack(message)?;
-        }
-        Ok(arrived)
+        self.consumers.exchange(
+            self.server.as_str(),
+            || {
+                let mut client = self.connect()?;
+                client.ensure_stream(&self.stream, &[&self.subject])?;
+                client.ensure_consumer(&self.stream, &self.consumer)?;
+                Ok(client)
+            },
+            |client| {
+                let arrived = client.fetch(&self.stream, &self.consumer, self.batch)?;
+                for message in &arrived {
+                    client.ack(message)?;
+                }
+                Ok(arrived)
+            },
+        )
     }
 
     /// Publish on the connection kept for the server, connected on the
@@ -472,6 +483,57 @@ mod tests {
         assert_eq!(events[0], Event::StreamCreated("orders".into()));
         assert_eq!(events[1], Event::ConsumerCreated("xmip".into()));
         assert!(receiver.join().expect("thread").expect("empty").is_empty());
+    }
+
+    #[test]
+    fn three_receives_make_sure_once_and_a_connection_the_server_closed_is_replaced() {
+        let (listener, address) = far_end().bind().expect("binding");
+        let near = JetStreamTransport::new(address, "orders", "orders.*")
+            .in_batches_of(1)
+            .timing_out_after(secs(2));
+        let (go, going) = std::sync::mpsc::channel();
+        let receiver = std::thread::spawn(move || {
+            let mut arrived = Vec::new();
+            for _ in 0..3 {
+                arrived.extend(near.receive()?);
+            }
+            going.recv().expect("go");
+            arrived.extend(near.receive()?);
+            Ok::<_, transport::TransportError>((arrived, near.consumers.opened()))
+        });
+        // A second's quiet ends the serving of the first session: the
+        // client waits for the word to go on, its connection still open.
+        let accept = || {
+            Session::accept(&listener, Some(secs(1)))
+                .expect("accepting")
+                .with_stream("orders", &["orders.*"])
+                .with_messages("orders.new", &[b"first", b"second", b"third"])
+        };
+        let served = |session: &mut Session| {
+            let mut events = Vec::new();
+            while let Ok(Some(event)) = session.next_event() {
+                events.push(event);
+            }
+            events
+        };
+        let count =
+            |events: &[Event], what: fn(&Event) -> bool| events.iter().filter(|e| what(e)).count();
+        let acked = |e: &Event| matches!(e, Event::Acked(_));
+        let made = |e: &Event| matches!(e, Event::ConsumerCreated(_));
+        // One connection and one consumer made sure of, for three pulls.
+        let mut session = accept();
+        let events = served(&mut session);
+        assert_eq!(count(&events, acked), 3, "{events:?}");
+        assert_eq!(count(&events, made), 1, "{events:?}");
+        drop(session);
+        go.send(()).expect("went");
+        let mut again = accept();
+        let events = served(&mut again);
+        assert_eq!(count(&events, acked), 1, "{events:?}");
+        let (arrived, opened) = receiver.join().expect("thread").expect("receiving");
+        let bytes: Vec<&[u8]> = arrived.iter().map(|one| &one.bytes[..]).collect();
+        assert_eq!(bytes, [&b"first"[..], b"second", b"third", b"first"]);
+        assert_eq!(opened, 2);
     }
 
     #[test]
