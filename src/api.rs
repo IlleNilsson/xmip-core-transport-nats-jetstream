@@ -17,6 +17,11 @@ pub const INBOX: &str = "_INBOX";
 pub const ACK_PREFIX: &str = "$JS.ACK";
 /// The one word an acknowledgement carries.
 pub const ACK: &[u8] = b"+ACK";
+/// The one word a negative acknowledgement carries: deliver it again.
+pub const NAK: &[u8] = b"-NAK";
+/// The one word that ends a message's deliveries without acknowledging it
+/// as processed: never deliver it again.
+pub const TERM: &[u8] = b"+TERM";
 
 #[must_use]
 pub fn stream_info(stream: &str) -> String {

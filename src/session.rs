@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use nats::wire::{Line, encode, read};
 use serde_json::{Value, json};
-use transport::Arrived;
+use transport::Taken;
 use transport::error::{Result, classify, protocol_error};
 use transport::socket;
 
@@ -27,12 +27,18 @@ pub enum Event {
     StreamCreated(String),
     /// The client created a consumer.
     ConsumerCreated(String),
-    /// The client published under the stream; here is the Stream.
-    Published(Arrived),
+    /// The client published under the stream; here is what it published.
+    Published(Taken),
     /// The client pulled; this many were delivered.
     Fetched { consumer: String, delivered: usize },
     /// The client acknowledged the message at this sequence.
     Acked(u64),
+    /// The client asked the message at this sequence delivered again
+    /// (`-NAK`).
+    Naked(u64),
+    /// The client ended the deliveries of the message at this sequence
+    /// without processing it (`+TERM`): it is not delivered again.
+    Termed(u64),
 }
 
 struct Stream {
@@ -128,7 +134,7 @@ impl Session {
     ///
     /// # Errors
     /// Where the connection broke, or nothing arrived before the timeout.
-    pub fn next_publish(&mut self) -> Result<Option<Arrived>> {
+    pub fn next_publish(&mut self) -> Result<Option<Taken>> {
         loop {
             match self.next_event()? {
                 Some(Event::Published(arrived)) => return Ok(Some(arrived)),
@@ -182,6 +188,12 @@ impl Session {
         if subject.starts_with(api::ACK_PREFIX) {
             let seq = api::stream_seq_of(subject)
                 .ok_or_else(|| protocol_error("an acknowledgement naming no sequence"))?;
+            if payload == api::NAK {
+                return Ok(Some(Event::Naked(seq)));
+            }
+            if payload == api::TERM {
+                return Ok(Some(Event::Termed(seq)));
+            }
             self.acked.push(seq);
             return Ok(Some(Event::Acked(seq)));
         }
@@ -199,7 +211,7 @@ impl Session {
         );
         let ack = api::pub_ack(&stream.name, seq);
         self.answer(reply, &ack)?;
-        Ok(Some(Event::Published(Arrived::new(origin, payload))))
+        Ok(Some(Event::Published(Taken::new(origin, payload))))
     }
 
     fn api(&mut self, rest: &str, reply: Option<&str>, payload: &[u8]) -> Result<Option<Event>> {

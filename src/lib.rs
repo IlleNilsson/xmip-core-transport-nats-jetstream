@@ -6,11 +6,14 @@
 //! `JetStream` is NATS made durable: a stream on the server stores what is
 //! published under its subjects, a consumer keeps its place in that stream,
 //! and both outlive the connection that made them. A Receive Location makes
-//! sure its stream and durable pull consumer exist, pulls a batch and
-//! acknowledges each message it hands up — a restart resumes from the last
-//! acknowledgement. A Send Location publishes and waits for the stream to
-//! answer with the sequence it stored the message at; no answer means no
-//! stream took it, and that is retryable.
+//! sure its stream and durable pull consumer exist, pulls a batch and hands
+//! each message up unacknowledged: after the runtime's receive cycle it is
+//! `+ACK`ed when accepted, `+TERM`ed when refused, never to be delivered
+//! again, and `-NAK`ed when the cycle failed, for the server to deliver
+//! again — a restart resumes from the last acknowledgement. A Send
+//! Location publishes and waits for the stream to answer with the sequence
+//! it stored the message at; no answer means no stream took it, and that is
+//! retryable.
 //!
 //! It is all core NATS underneath — the API is request and reply on
 //! `$JS.API.*` subjects with JSON bodies, and delivery is a MSG whose reply
@@ -31,7 +34,7 @@ pub mod session;
 use std::net::TcpListener;
 use std::time::Duration;
 
-pub use client::JetStream;
+pub use client::{JetStream, Pulled};
 use net::Target;
 pub use session::{Event, Session};
 use transport::error::TransportError;
@@ -39,7 +42,9 @@ use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Configured, Directions, Pool, Transport};
+use transport::{
+    Acknowledgement, Arrived, Configured, Directions, Pool, Taken, Transport, Verdict,
+};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 /// The durable consumer a Location pulls as unless told otherwise.
@@ -162,11 +167,19 @@ impl Transport for JetStreamTransport {
         Directions::BOTH
     }
 
-    /// Pull one batch and acknowledge each message, on the connection the
-    /// first receive opened and made sure of the stream and consumer on,
-    /// and kept.
+    fn arrivals(&self) -> transport::Arrivals {
+        transport::Arrivals::Ordered(
+            "the acknowledgement goes on the session the receive reads from",
+        )
+    }
+
+    /// Pull one batch, on the connection the first receive opened and made
+    /// sure of the stream and consumer on, and kept. Nothing is
+    /// acknowledged here: each message's [`answering`] `+ACK`s it after the
+    /// receive cycle accepted it, `+TERM`s it when it refused it and
+    /// `-NAK`s it when the cycle failed.
     fn receive(&self) -> Result<Vec<Arrived>> {
-        self.consumers.exchange(
+        let pulled = self.consumers.exchange(
             self.server.as_str(),
             || {
                 let mut client = self.connect()?;
@@ -174,14 +187,15 @@ impl Transport for JetStreamTransport {
                 client.ensure_consumer(&self.stream, &self.consumer)?;
                 Ok(client)
             },
-            |client| {
-                let arrived = client.fetch(&self.stream, &self.consumer, self.batch)?;
-                for message in &arrived {
-                    client.ack(message)?;
-                }
-                Ok(arrived)
-            },
-        )
+            |client| client.fetch(&self.stream, &self.consumer, self.batch),
+        )?;
+        Ok(pulled
+            .into_iter()
+            .map(|message| {
+                let acknowledgement = answering(&self.consumers, &self.server, message.ack_subject);
+                Arrived::whole(message.origin_uri, message.payload, acknowledgement)
+            })
+            .collect())
     }
 
     /// Publish on the connection kept for the server, connected on the
@@ -194,6 +208,31 @@ impl Transport for JetStreamTransport {
             |client| client.publish(subject, bytes).map(|_| ()),
         )
     }
+}
+
+/// The acknowledgement of a pulled message, published to `ack_subject` on
+/// the connection `consumers` keeps for `server`: `+ACK` on
+/// [`Verdict::Accepted`], `+TERM` on [`Verdict::Refused`] — the server
+/// stops delivering it without counting it processed — and `-NAK` on
+/// [`Verdict::Failed`] for the server to deliver it again at once, each
+/// flushed — one PING and PONG. Where the
+/// server closed that connection meanwhile none is opened: the server
+/// delivers again, after the consumer's ack wait, what was not answered.
+fn answering(consumers: &Pool<JetStream>, server: &str, ack_subject: String) -> Acknowledgement {
+    let consumers = consumers.clone();
+    let server = server.to_string();
+    Acknowledgement::deferred(move |verdict| {
+        consumers.kept(
+            server.as_str(),
+            "the connection that pulled the message is closed; \
+             the server delivers it again after the ack wait",
+            |client| match verdict {
+                Verdict::Accepted => client.ack(&ack_subject),
+                Verdict::Refused(_) => client.term(&ack_subject),
+                Verdict::Failed => client.nak(&ack_subject),
+            },
+        )
+    })
 }
 
 impl Configured for JetStreamTransport {
@@ -286,7 +325,7 @@ impl JetStreamTransport {
 }
 
 impl Accepting for JetStreamTransport {
-    fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
+    fn take_one(self, listener: &TcpListener) -> Result<Taken> {
         let mut session = self.accept_one(listener)?;
         // The acknowledgement goes out before the publish is reported, so
         // the client has its sequence by the time this returns.
@@ -430,15 +469,26 @@ mod tests {
     }
 
     #[test]
-    fn a_receive_ensures_the_stream_and_consumer_then_pulls_and_acks() {
+    fn a_receive_ensures_the_stream_and_consumer_then_pulls_and_acks_naks_or_terms() {
         let far_end = far_end();
         let (listener, address) = far_end.bind().expect("binding");
         let receiver = std::thread::spawn(move || {
-            JetStreamTransport::new(address, "orders", "orders.*")
+            let near = JetStreamTransport::new(address, "orders", "orders.*")
                 .as_consumer("probe")
-                .in_batches_of(2)
-                .timing_out_after(secs(2))
-                .receive()
+                .in_batches_of(3)
+                .timing_out_after(secs(2));
+            let mut arrived = near.receive()?.into_iter();
+            let first = arrived.next().expect("first");
+            assert!(first.defers());
+            let first = first.taken()?;
+            let second = arrived.next().expect("second");
+            let origin = second.origin_uri.clone();
+            second.failed()?;
+            arrived
+                .next()
+                .expect("third")
+                .refused(transport::Refusal::Forbidden)?;
+            Ok::<_, transport::TransportError>((first, origin))
         });
         let mut session = Session::accept(&listener, Some(secs(2)))
             .expect("accepting")
@@ -454,18 +504,18 @@ mod tests {
                 Event::ConsumerCreated("probe".into()),
                 Event::Fetched {
                     consumer: "probe".into(),
-                    delivered: 2
+                    delivered: 3
                 },
                 Event::Acked(1),
-                Event::Acked(2),
+                Event::Naked(2),
+                Event::Termed(3),
             ]
         );
-        assert_eq!(session.acked(), [1, 2]);
-        let arrived = receiver.join().expect("thread").expect("receiving");
-        assert_eq!(arrived.len(), 2);
-        assert_eq!(arrived[0].bytes, b"first");
-        assert!(arrived[0].origin_uri.ends_with("/orders/orders.new?seq=1"));
-        assert!(arrived[1].origin_uri.ends_with("/orders/orders.new?seq=2"));
+        assert_eq!(session.acked(), [1]);
+        let (first, second) = receiver.join().expect("thread").expect("receiving");
+        assert_eq!(first.bytes, b"first");
+        assert!(first.origin_uri.ends_with("/orders/orders.new?seq=1"));
+        assert!(second.ends_with("/orders/orders.new?seq=2"));
 
         // A bare session has no stream: the receive creates it and the
         // consumer, finds nothing, and nothing there is not an error.
@@ -495,10 +545,14 @@ mod tests {
         let receiver = std::thread::spawn(move || {
             let mut arrived = Vec::new();
             for _ in 0..3 {
-                arrived.extend(near.receive()?);
+                for one in near.receive()? {
+                    arrived.push(one.taken()?.bytes);
+                }
             }
             going.recv().expect("go");
-            arrived.extend(near.receive()?);
+            for one in near.receive()? {
+                arrived.push(one.taken()?.bytes);
+            }
             Ok::<_, transport::TransportError>((arrived, near.consumers.opened()))
         });
         // A second's quiet ends the serving of the first session: the
@@ -531,7 +585,7 @@ mod tests {
         let events = served(&mut again);
         assert_eq!(count(&events, acked), 1, "{events:?}");
         let (arrived, opened) = receiver.join().expect("thread").expect("receiving");
-        let bytes: Vec<&[u8]> = arrived.iter().map(|one| &one.bytes[..]).collect();
+        let bytes: Vec<&[u8]> = arrived.iter().map(Vec::as_slice).collect();
         assert_eq!(bytes, [&b"first"[..], b"second", b"third", b"first"]);
         assert_eq!(opened, 2);
     }
