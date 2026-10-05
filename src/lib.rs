@@ -201,11 +201,25 @@ impl Transport for JetStreamTransport {
     /// Publish on the connection kept for the server, connected on the
     /// first send to it, and wait for the stream's acknowledgement.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
+        self.publish(target, bytes, None)
+    }
+
+    /// The key is the message's `Nats-Msg-Id` header: a stream that holds a
+    /// message under that id within its duplicate window stores nothing,
+    /// and acknowledges the first one's sequence.
+    fn send_keyed(&self, target: &str, bytes: &[u8], key: &str) -> Result<()> {
+        self.publish(target, bytes, Some(key))
+    }
+}
+
+impl JetStreamTransport {
+    /// The one send, on the publisher kept for the target's server.
+    fn publish(&self, target: &str, bytes: &[u8], key: Option<&str>) -> Result<()> {
         let (server, subject) = self.resolve(target);
         self.publishers.exchange(
             server,
-            || JetStream::connect(server, &self.name, self.timeout),
-            |client| client.publish(subject, bytes).map(|_| ()),
+            || JetStream::publishing(server, &self.name, self.timeout),
+            |client| client.publish(subject, bytes, key).map(|_| ()),
         )
     }
 }
@@ -406,10 +420,10 @@ mod tests {
             near.send("orders.new", b"order 1\r\nline 2")?;
             near.send(&format!("nats-jetstream://{address}/orders.cancel"), b"")?;
             let mut client = near.connect()?;
-            let seq = client.publish("orders.new", b"third")?;
+            let seq = client.publish("orders.new", b"third", None)?;
             drop(client);
             let mut impatient = JetStream::connect(&address, "probe", Some(secs(1)))?;
-            let refused = impatient.publish("other.subject", b"nobody");
+            let refused = impatient.publish("other.subject", b"nobody", None);
             Ok::<_, transport::TransportError>((seq, refused))
         });
         let mut session = far_end.accept_one(&listener).expect("accepting");

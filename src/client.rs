@@ -42,7 +42,20 @@ impl JetStream {
     /// Where the server could not be reached, did not open with INFO, or
     /// does not run `JetStream`.
     pub fn connect(server: &str, name: &str, timeout: Option<Duration>) -> Result<Self> {
-        let client = Client::connect(server, name, timeout)?;
+        Self::open(Client::connect(server, name, timeout)?)
+    }
+
+    /// [`JetStream::connect`] for a publisher: a connection that says it
+    /// sends headers, so a keyed publish can carry its `Nats-Msg-Id`. A
+    /// consumer connects without, and is delivered messages without them.
+    ///
+    /// # Errors
+    /// As [`JetStream::connect`].
+    pub fn publishing(server: &str, name: &str, timeout: Option<Duration>) -> Result<Self> {
+        Self::open(Client::connect_with_headers(server, name, timeout)?)
+    }
+
+    fn open(client: Client) -> Result<Self> {
         let info: Value = serde_json::from_str(client.info())
             .map_err(|e| protocol_error(format!("an INFO that is not JSON: {e}")))?;
         if info.get("jetstream").and_then(Value::as_bool) != Some(true) {
@@ -96,19 +109,32 @@ impl JetStream {
         }
     }
 
-    /// Publish `bytes` on `subject` and wait for the stream that took it to
-    /// say so; the sequence it was stored at.
+    /// Publish `bytes` on `subject`, under `key` as its `Nats-Msg-Id`
+    /// where there is one, and wait for the stream that took it to say so;
+    /// the sequence it was stored at. A stream that holds a message under
+    /// that id within its duplicate window stores nothing and answers the
+    /// first one's sequence.
     ///
     /// # Errors
     /// Where no stream answered before the timeout — no stream covers the
     /// subject, or the server is slow, and both are worth another try — or
     /// the server refused the message.
-    pub fn publish(&mut self, subject: &str, bytes: &[u8]) -> Result<u64> {
+    pub fn publish(&mut self, subject: &str, bytes: &[u8], key: Option<&str>) -> Result<u64> {
         let reply = self.next_reply();
-        self.client.write(&Line::Pub {
-            subject: subject.to_string(),
-            reply: Some(reply.clone()),
-            payload: bytes.to_vec(),
+        let subject = subject.to_string();
+        let payload = bytes.to_vec();
+        self.client.write(&match key {
+            Some(key) => Line::HPub {
+                subject: subject.clone(),
+                reply: Some(reply.clone()),
+                headers: vec![(api::MSG_ID.to_string(), key.to_string())],
+                payload,
+            },
+            None => Line::Pub {
+                subject: subject.clone(),
+                reply: Some(reply.clone()),
+                payload,
+            },
         })?;
         let answer = self.wait_for(&reply).map_err(|error| {
             if error.retryable {

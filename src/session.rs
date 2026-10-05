@@ -46,6 +46,9 @@ struct Stream {
     subjects: Vec<String>,
     /// Subject and payload, the sequence being the index plus one.
     messages: Vec<(String, Vec<u8>)>,
+    /// The sequence each `Nats-Msg-Id` was stored at: a publish under one
+    /// already here is a duplicate, stored once.
+    ids: BTreeMap<String, u64>,
 }
 
 pub struct Session {
@@ -81,7 +84,7 @@ impl Session {
             "server_id": "xmip",
             "version": "2.10.0",
             "jetstream": true,
-            "headers": false,
+            "headers": true,
             "max_payload": 1_048_576,
         });
         session.write(&Line::Info(info.to_string()))?;
@@ -100,6 +103,7 @@ impl Session {
             name: name.to_string(),
             subjects: subjects.iter().map(ToString::to_string).collect(),
             messages: Vec::new(),
+            ids: BTreeMap::new(),
         });
         self
     }
@@ -157,7 +161,19 @@ impl Session {
                     reply,
                     payload,
                 }) => {
-                    if let Some(event) = self.on_pub(&subject, reply.as_deref(), payload)? {
+                    if let Some(event) = self.on_pub(&subject, reply.as_deref(), payload, None)? {
+                        return Ok(Some(event));
+                    }
+                }
+                Some(Line::HPub {
+                    subject,
+                    reply,
+                    headers,
+                    payload,
+                }) => {
+                    let id = headers.into_iter().find(|(name, _)| name == api::MSG_ID);
+                    let id = id.map(|(_, id)| id);
+                    if let Some(event) = self.on_pub(&subject, reply.as_deref(), payload, id)? {
                         return Ok(Some(event));
                     }
                 }
@@ -174,12 +190,14 @@ impl Session {
         }
     }
 
-    /// An API request, an acknowledgement, or a message for the stream.
+    /// An API request, an acknowledgement, or a message for the stream,
+    /// under its `Nats-Msg-Id` where it carried one.
     fn on_pub(
         &mut self,
         subject: &str,
         reply: Option<&str>,
         payload: Vec<u8>,
+        id: Option<String>,
     ) -> Result<Option<Event>> {
         if let Some(rest) = subject.strip_prefix(&format!("{}.", api::API)) {
             let rest = rest.to_string();
@@ -203,13 +221,19 @@ impl Session {
         if !stream.subjects.iter().any(|s| matches(s, subject)) {
             return Ok(None);
         }
-        stream.messages.push((subject.to_string(), payload.clone()));
-        let seq = u64::try_from(stream.messages.len()).unwrap_or(0);
+        let held = id.as_ref().and_then(|id| stream.ids.get(id).copied());
+        let seq = held.unwrap_or_else(|| {
+            stream.messages.push((subject.to_string(), payload.clone()));
+            u64::try_from(stream.messages.len()).unwrap_or(0)
+        });
+        if let Some(id) = id {
+            stream.ids.insert(id, seq);
+        }
         let origin = format!(
             "nats-jetstream://{}/{}/{subject}?seq={seq}",
             self.peer, stream.name
         );
-        let ack = api::pub_ack(&stream.name, seq);
+        let ack = api::pub_ack(&stream.name, seq, held.is_some());
         self.answer(reply, &ack)?;
         Ok(Some(Event::Published(Taken::new(origin, payload))))
     }
@@ -221,9 +245,9 @@ impl Session {
             ["STREAM", "INFO", name] if known.as_deref() == Some(*name) => {
                 (self.stream_info(), None)
             }
-            ["STREAM", "INFO", _] => (not_found(10059, "stream not found"), None),
+            ["STREAM", "INFO", _] => (api::not_found(10059, "stream not found"), None),
             ["STREAM", "CREATE", name] => {
-                let config = json_of(payload)?;
+                let config = api::request(payload)?;
                 let subjects = config["subjects"]
                     .as_array()
                     .map(|s| s.iter().filter_map(Value::as_str).collect::<Vec<_>>())
@@ -232,6 +256,7 @@ impl Session {
                     name: (*name).to_string(),
                     subjects: subjects.iter().map(ToString::to_string).collect(),
                     messages: Vec::new(),
+                    ids: BTreeMap::new(),
                 });
                 (
                     self.stream_info(),
@@ -239,18 +264,18 @@ impl Session {
                 )
             }
             ["CONSUMER", "INFO", _, consumer] if self.consumers.contains_key(*consumer) => {
-                (consumer_info(consumer), None)
+                (api::consumer_answer(consumer), None)
             }
-            ["CONSUMER", "INFO", _, _] => (not_found(10014, "consumer not found"), None),
+            ["CONSUMER", "INFO", _, _] => (api::not_found(10014, "consumer not found"), None),
             ["CONSUMER", "CREATE", _, consumer] => {
                 self.consumers.entry((*consumer).to_string()).or_insert(1);
                 (
-                    consumer_info(consumer),
+                    api::consumer_answer(consumer),
                     Some(Event::ConsumerCreated((*consumer).to_string())),
                 )
             }
             ["CONSUMER", "MSG", "NEXT", _, consumer] => {
-                let batch = json_of(payload)?["batch"].as_u64().unwrap_or(1);
+                let batch = api::request(payload)?["batch"].as_u64().unwrap_or(1);
                 let delivered = self.deliver(consumer, batch, reply)?;
                 let event = Event::Fetched {
                     consumer: (*consumer).to_string(),
@@ -266,7 +291,7 @@ impl Session {
 
     fn stream_info(&self) -> Value {
         let Some(stream) = &self.stream else {
-            return not_found(10059, "stream not found");
+            return api::not_found(10059, "stream not found");
         };
         json!({
             "config": { "name": stream.name, "subjects": stream.subjects },
@@ -346,25 +371,6 @@ impl Session {
             .flush()
             .map_err(|e| classify("flushing a protocol line", &e))
     }
-}
-
-fn consumer_info(consumer: &str) -> Value {
-    json!({
-        "name": consumer,
-        "config": { "durable_name": consumer, "ack_policy": "explicit" },
-    })
-}
-
-fn not_found(err_code: u32, description: &str) -> Value {
-    ApiError::new(404, err_code, description).to_json()
-}
-
-fn json_of(payload: &[u8]) -> Result<Value> {
-    if payload.is_empty() {
-        return Ok(Value::Null);
-    }
-    serde_json::from_slice(payload)
-        .map_err(|e| protocol_error(format!("a request that is not JSON: {e}")))
 }
 
 /// Whether `subject` is under `pattern`: `*` is one token, `>` the rest.
