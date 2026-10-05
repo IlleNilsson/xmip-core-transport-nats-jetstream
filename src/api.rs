@@ -84,10 +84,48 @@ pub fn next_request(batch: usize, expires: Option<Duration>) -> Value {
     request
 }
 
-/// What the server answers a publish with: where it went and its sequence.
+/// The header a publish carries its deduplication key in: a stream holding
+/// a message under the same id within its duplicate window stores nothing.
+pub const MSG_ID: &str = "Nats-Msg-Id";
+
+/// What the server answers a publish with: where it went and its sequence,
+/// and, for a publish whose `Nats-Msg-Id` the stream already held, that it
+/// was a duplicate and the sequence the first one was stored at.
 #[must_use]
-pub fn pub_ack(stream: &str, seq: u64) -> Value {
-    json!({ "stream": stream, "seq": seq })
+pub fn pub_ack(stream: &str, seq: u64, duplicate: bool) -> Value {
+    if duplicate {
+        json!({ "stream": stream, "seq": seq, "duplicate": true })
+    } else {
+        json!({ "stream": stream, "seq": seq })
+    }
+}
+
+/// What the server answers a consumer's info or creation with: its name
+/// and its durable, explicitly acknowledged configuration.
+#[must_use]
+pub fn consumer_answer(consumer: &str) -> Value {
+    json!({
+        "name": consumer,
+        "config": { "durable_name": consumer, "ack_policy": "explicit" },
+    })
+}
+
+/// What the server answers a request for what is not there.
+#[must_use]
+pub fn not_found(err_code: u32, description: &str) -> Value {
+    ApiError::new(404, err_code, description).to_json()
+}
+
+/// The JSON an API request carries: null where it carries nothing.
+///
+/// # Errors
+/// Where the request carries something that is not JSON.
+pub fn request(payload: &[u8]) -> Result<Value> {
+    if payload.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_slice(payload)
+        .map_err(|e| protocol_error(format!("a request that is not JSON: {e}")))
 }
 
 /// The reply subject a delivered message carries — the acknowledgement goes
@@ -248,7 +286,8 @@ mod tests {
         assert_eq!(next["batch"], 5);
         assert_eq!(next["expires"], 2_000_000_000u64);
         assert!(next_request(1, None).get("expires").is_none());
-        assert_eq!(pub_ack("orders", 3)["seq"], 3);
+        assert_eq!(pub_ack("orders", 3, false)["seq"], 3);
+        assert_eq!(pub_ack("orders", 3, true)["duplicate"], true);
     }
 
     #[test]

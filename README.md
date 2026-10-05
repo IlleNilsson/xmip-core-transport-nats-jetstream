@@ -13,6 +13,10 @@ A pulled message is acknowledged after the runtime's whole receive cycle, never 
 
 A send target is read by `net::Target` in [xmip-core-library-net](https://github.com/IlleNilsson/xmip-core-library-net), the one reading of a URI every technology calls: scheme, authority, path and decoded query. Until 2026-09-28 it was read through the transport capability's `socket::target`, which split it on its first slash and left the query in the path.
 
+## The deduplication key
+
+A keyed send (`Transport::send_keyed`, built 2026-10-04) publishes with headers — an HPUB, through the nats technology's `wire::Line::HPub` — carrying the Journey's identifier as `Nats-Msg-Id` (`api::MSG_ID`), the same on every attempt of one Journey. A stream that holds a message under that id within its duplicate window stores nothing and acknowledges the first one's sequence, `"duplicate": true`; the in-process `Session` does the same. The publishing connection says `headers` in its CONNECT (`JetStream::publishing`); a consumer's does not, and is delivered messages without them. An unkeyed `send` is a plain PUB, as before. The answers the `Session` writes for a consumer and a missing stream or consumer, and the reading of a request's JSON, moved into `api.rs` beside the rest of the API the same day.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
