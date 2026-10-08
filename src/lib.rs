@@ -37,6 +37,7 @@ use std::time::Duration;
 pub use client::{JetStream, Pulled};
 use net::Target;
 pub use session::{Event, Session};
+use transport::ArrivalIdentity;
 use transport::error::TransportError;
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
@@ -193,7 +194,7 @@ impl Transport for JetStreamTransport {
             .into_iter()
             .map(|message| {
                 let acknowledgement = answering(&self.consumers, &self.server, message.ack_subject);
-                Arrived::whole(message.origin_uri, message.payload, acknowledgement)
+                Arrived::whole(message.origin_uri, message.payload, acknowledgement).detected()
             })
             .collect())
     }
@@ -350,6 +351,12 @@ impl Accepting for JetStreamTransport {
 }
 
 impl Loopback for JetStreamTransport {
+    fn arrival_identity(&self) -> ArrivalIdentity {
+        ArrivalIdentity::Unnamed(
+            "the broker delivers it and names no sender; the peer is the broker",
+        )
+    }
+
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }
