@@ -174,6 +174,10 @@ impl Transport for JetStreamTransport {
         )
     }
 
+    fn waiting(&self) -> transport::Waiting {
+        transport::Waiting::Waits("a pull waits on the server until its batch or its expiry")
+    }
+
     /// Pull one batch, on the connection the first receive opened and made
     /// sure of the stream and consumer on, and kept. Nothing is
     /// acknowledged here: each message's [`answering`] `+ACK`s it after the
