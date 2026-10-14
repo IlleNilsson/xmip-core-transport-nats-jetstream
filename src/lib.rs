@@ -444,7 +444,7 @@ mod tests {
         // The same server, so the same connection: connected once.
         let second = session.next_publish().expect("second").expect("one");
         assert!(second.origin_uri.ends_with("/orders/orders.cancel?seq=2"));
-        assert!(second.bytes.is_empty());
+        assert_eq!(second.bytes, [] as [u8; 0]);
         let mut session = far_end.accept_one(&listener).expect("third");
         assert_eq!(
             session.next_publish().expect("third").expect("one").bytes,
