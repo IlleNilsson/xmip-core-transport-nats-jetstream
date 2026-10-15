@@ -462,6 +462,35 @@ mod tests {
     }
 
     #[test]
+    fn what_only_a_server_sends_is_answered_err_over_what_the_client_sent_after() {
+        // A client pipelines. The -ERR is written with megabytes it sent
+        // after the INFO unread, which a bare drop resets away on Windows.
+        let far_end = far_end();
+        let (listener, address) = far_end.bind().expect("binding");
+        let serving = std::thread::spawn(move || {
+            let mut session = far_end.accept_one(&listener).expect("accepting");
+            session.next_event().expect_err("refused")
+        });
+        let head = b"CONNECT {}\r\nINFO {}\r\nPUB orders.new 4194304\r\n";
+        let answer = transport::unread::answered_over_unread(&address, head, b'x', |stream| {
+            let mut reader = std::io::BufReader::new(stream);
+            let mut said = String::new();
+            for _ in 0..2 {
+                if let Err(error) = std::io::BufRead::read_line(&mut reader, &mut said) {
+                    said.push_str(&error.to_string());
+                }
+            }
+            said
+        });
+        assert!(
+            answer.contains("\r\n-ERR 'Unknown Protocol Operation'"),
+            "{answer}"
+        );
+        let refused = serving.join().expect("the far end");
+        assert!(refused.message.contains("Info"), "{refused}");
+    }
+
+    #[test]
     fn a_thousand_publishes_connect_once_and_a_connection_the_server_closed_is_replaced() {
         const SENDS: usize = 1000;
         let far_end = far_end().timing_out_after(secs(5));

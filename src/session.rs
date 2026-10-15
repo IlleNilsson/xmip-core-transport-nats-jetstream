@@ -184,6 +184,7 @@ impl Session {
                 None => return Ok(None),
                 Some(other) => {
                     self.write(&Line::Err("Unknown Protocol Operation".to_string()))?;
+                    socket::finish(&self.writer)?;
                     return Err(protocol_error(format!("{other:?} from a client")));
                 }
             }
