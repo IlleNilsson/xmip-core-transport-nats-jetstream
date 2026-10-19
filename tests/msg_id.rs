@@ -17,8 +17,8 @@ fn a_keyed_publish_carries_the_journey_id_as_its_msg_id_and_is_stored_once() {
     let (listener, address) = far_end.bind().expect("bound");
     let sender = thread::spawn(move || {
         let near = JetStreamTransport::new(address, "probe", "probe");
-        near.send_keyed("probe", b"order", KEY)?;
-        near.send_keyed("probe", b"order", KEY)?;
+        near.send_from("probe", transport::Outgoing::held(b"order").keyed(KEY))?;
+        near.send_from("probe", transport::Outgoing::held(b"order").keyed(KEY))?;
         near.send("probe", b"order")
     });
     let mut session = far_end.accept_one(&listener).expect("accepted");
