@@ -183,7 +183,7 @@ impl Transport for JetStreamTransport {
     /// acknowledged here: each message's [`answering`] `+ACK`s it after the
     /// receive cycle accepted it, `+TERM`s it when it refused it and
     /// `-NAK`s it when the cycle failed.
-    fn receive(&self) -> Result<Vec<Arrived>> {
+    fn receive_up_to(&self, most: usize) -> Result<Vec<Arrived>> {
         let pulled = self.consumers.exchange(
             self.server.as_str(),
             || {
@@ -192,7 +192,7 @@ impl Transport for JetStreamTransport {
                 client.ensure_consumer(&self.stream, &self.consumer)?;
                 Ok(client)
             },
-            |client| client.fetch(&self.stream, &self.consumer, self.batch),
+            |client| client.fetch(&self.stream, &self.consumer, self.batch.min(most)),
         )?;
         Ok(pulled
             .into_iter()
@@ -203,17 +203,20 @@ impl Transport for JetStreamTransport {
             .collect())
     }
 
-    /// Publish on the connection kept for the server, connected on the
-    /// first send to it, and wait for the stream's acknowledgement.
-    fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
-        self.publish(target, bytes, None)
+    fn sending(&self) -> transport::Sending {
+        transport::Sending::Gathered(
+            "one PUB carries the whole body within the server's max_payload",
+        )
     }
 
+    /// Publish on the connection kept for the server, connected on the
+    /// first send to it, and wait for the stream's acknowledgement.
     /// The key is the message's `Nats-Msg-Id` header: a stream that holds a
     /// message under that id within its duplicate window stores nothing,
     /// and acknowledges the first one's sequence.
-    fn send_keyed(&self, target: &str, bytes: &[u8], key: &str) -> Result<()> {
-        self.publish(target, bytes, Some(key))
+    fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
+        let bytes: &[u8] = &outgoing.gather()?;
+        self.publish(target, bytes, outgoing.key())
     }
 }
 
