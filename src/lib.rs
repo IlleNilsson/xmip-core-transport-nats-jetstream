@@ -151,7 +151,7 @@ impl JetStreamTransport {
     /// Where a target names the server and subject itself, or is a subject
     /// alone on this transport's server.
     fn resolve<'a>(&'a self, target: &'a str) -> (&'a str, &'a str) {
-        match Target::naming_server(&["nats-jetstream"], target) {
+        match Target::naming_server(Self::SCHEMES, target) {
             Some(named) if named.path().is_empty() => (named.authority(), &self.subject),
             Some(named) => (named.authority(), named.path()),
             None => (&self.server, target),
@@ -314,6 +314,9 @@ impl Configured for JetStreamTransport {
             },
         ],
     };
+
+    /// The schemes a Location's address is entered with to choose this technology.
+    const SCHEMES: &'static [&'static str] = &["nats-jetstream"];
 
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         let stream = settings.optional_text("stream").unwrap_or_default();
