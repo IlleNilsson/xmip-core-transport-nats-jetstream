@@ -1,5 +1,5 @@
 //! A keyed send carries its deduplication key in the `Nats-Msg-Id` header,
-//! the same on every attempt of one Journey: the stream stores it once and
+//! the same on every attempt on one Journey: the stream stores it once and
 //! acknowledges the second publish at the first one's sequence. An unkeyed
 //! send carries none and is stored again.
 
