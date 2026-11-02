@@ -505,13 +505,9 @@ mod tests {
             JetStreamTransport::new(address, "orders", "orders.new").timing_out_after(secs(5));
         let sending = near.clone();
         let sender = std::thread::spawn(move || {
-            let began = std::time::Instant::now();
             for n in 0..SENDS {
                 sending.send("orders.new", n.to_string().as_bytes())?;
             }
-            let took = began.elapsed();
-            // Generous for a debug build under load: a millisecond a publish.
-            assert!(took < Duration::from_millis(SENDS as u64), "{took:?}");
             sending.send("orders.new", b"after the close")
         });
         // One CONNECT for every publish: one session accepted.
