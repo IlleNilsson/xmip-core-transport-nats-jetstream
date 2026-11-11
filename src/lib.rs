@@ -38,6 +38,7 @@ pub use client::{JetStream, Pulled};
 use net::Target;
 pub use session::{Event, Session};
 use transport::ArrivalIdentity;
+use transport::destination;
 use transport::error::TransportError;
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
@@ -149,13 +150,11 @@ impl JetStreamTransport {
     }
 
     /// Where a target names the server and subject itself, or is a subject
-    /// alone on this transport's server.
+    /// alone on this transport's server, or empty and this transport's
+    /// subject (`transport::destination::on_server`).
     fn resolve<'a>(&'a self, target: &'a str) -> (&'a str, &'a str) {
-        match Target::naming_server(Self::SCHEMES, target) {
-            Some(named) if named.path().is_empty() => (named.authority(), &self.subject),
-            Some(named) => (named.authority(), named.path()),
-            None => (&self.server, target),
-        }
+        let named = Target::naming_server(Self::SCHEMES, target);
+        destination::on_server(target, named, (&self.server, &self.subject))
     }
 }
 
@@ -318,6 +317,11 @@ impl Configured for JetStreamTransport {
     /// The schemes a Location's address is entered with to choose this technology.
     const SCHEMES: &'static [&'static str] = &["nats-jetstream"];
 
+    /// The subject setting: the address names only the server.
+    fn own_target(_address: &str) -> &str {
+        destination::OWN
+    }
+
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         let stream = settings.optional_text("stream").unwrap_or_default();
         let mut transport =
@@ -465,6 +469,35 @@ mod tests {
         let error = refused.expect_err("no stream took it");
         assert!(error.retryable);
         assert!(error.message.contains("no stream acknowledged"));
+    }
+
+    #[test]
+    fn a_send_location_publishes_to_its_subject_and_a_target_naming_another_wins() {
+        use xcore::settings::Given;
+        let far_end = far_end();
+        let (listener, address) = far_end.bind().expect("binding");
+        let location = format!("nats-jetstream://{address}");
+        let sender = std::thread::spawn(move || {
+            let text = |name: &str, value: &str| (name.to_string(), Given::Text(value.to_string()));
+            let given = [text("subject", "orders.new"), text("timeout", "2s")];
+            let near = JetStreamTransport::open(&location, Applies::Send, &given)?;
+            near.send(JetStreamTransport::own_target(&location), b"own")?;
+            near.send("orders.cancel", b"other")
+        });
+        let mut session = far_end.accept_one(&listener).expect("accepting");
+        let own = session.next_publish().expect("own").expect("one");
+        assert!(
+            own.origin_uri.contains("/orders.new?"),
+            "{}",
+            own.origin_uri
+        );
+        let other = session.next_publish().expect("other").expect("one");
+        assert!(
+            other.origin_uri.contains("/orders.cancel?"),
+            "{}",
+            other.origin_uri
+        );
+        sender.join().expect("thread").expect("sending");
     }
 
     #[test]
