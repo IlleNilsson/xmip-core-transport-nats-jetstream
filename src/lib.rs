@@ -116,14 +116,6 @@ impl JetStreamTransport {
         self
     }
 
-    /// Give up on a server that stops mid-line, and end a batch when the
-    /// server has been quiet this long.
-    #[must_use]
-    pub const fn timing_out_after(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
     /// Connect to the server as a client.
     ///
     /// # Errors
@@ -303,14 +295,12 @@ impl Configured for JetStreamTransport {
                 meaning: "The name a Location presents to the server in CONNECT.",
                 applies: Applies::Both,
             },
-            Setting {
-                name: "timeout",
-                kind: Kind::Duration,
-                presence: Presence::Optional,
-                meaning: "How long a server that stops mid-line is waited on, and how long \
-                          a quiet server ends a batch; unbounded when left out.",
-                applies: Applies::Both,
-            },
+            transport::configured::timeout(
+                Applies::Both,
+                None,
+                "How long a server that stops mid-line is waited on, and how long \
+                 a quiet server ends a batch; unbounded when left out.",
+            ),
         ],
     };
 
@@ -320,6 +310,10 @@ impl Configured for JetStreamTransport {
     /// The subject setting: the address names only the server.
     fn own_target(_address: &str) -> &str {
         destination::OWN
+    }
+
+    fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
+        Some(&mut self.timeout)
     }
 
     fn configured(address: &str, settings: &Read) -> Result<Self> {
@@ -336,9 +330,6 @@ impl Configured for JetStreamTransport {
                 ))
             })?;
             transport = transport.in_batches_of(batch);
-        }
-        if let Some(timeout) = settings.optional_duration("timeout") {
-            transport = transport.timing_out_after(timeout);
         }
         Ok(transport)
     }
