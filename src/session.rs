@@ -251,8 +251,7 @@ impl Session {
                 let config = api::request(payload)?;
                 let subjects = config["subjects"]
                     .as_array()
-                    .map(|s| s.iter().filter_map(Value::as_str).collect::<Vec<_>>())
-                    .unwrap_or_default();
+                    .map_or_default(|s| s.iter().filter_map(Value::as_str).collect::<Vec<_>>());
                 self.stream = Some(Stream {
                     name: (*name).to_string(),
                     subjects: subjects.iter().map(ToString::to_string).collect(),
@@ -309,11 +308,7 @@ impl Session {
         let sid = self
             .sid_for(reply)
             .ok_or_else(|| protocol_error("a reply inbox nobody subscribed to"))?;
-        let stream_name = self
-            .stream
-            .as_ref()
-            .map(|s| s.name.clone())
-            .unwrap_or_default();
+        let stream_name = self.stream.as_ref().map_or_default(|s| s.name.clone());
         let cursor = *self.consumers.entry(consumer.to_string()).or_insert(1);
         let total = self.stream.as_ref().map_or(0, |s| s.messages.len());
         let mut delivered = 0;
