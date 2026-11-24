@@ -1,5 +1,5 @@
 //! The server's side of one connection, one stream's worth of `JetStream`:
-//! what a test puts at the far end, and what the essentials drives.
+//! what a test puts at the far end, and what the System Tests drive.
 //!
 //! Not a server. One session serves one client from a stream kept in
 //! memory: it answers the API subjects for that stream, stores what is
