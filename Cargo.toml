@@ -14,18 +14,32 @@ path = "src/lib.rs"
 # A Technology depends on its parent Capability, never the reverse
 # (repository-model.md). JetStream is core NATS with a request/reply API on
 # top, so the wire comes from the nats technology and the JSON the API
-# speaks from serde_json.
+# speaks from serde_json. Its declaration takes the capability's `timeout`
+# (`transport::configured::timeout`).
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
 # A target read as a URI writes it (`net::Target`).
-net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main" }
+net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main", optional = true }
 # The settings this technology declares (xcore::settings), read through
 # transport::Configured (ADR-0064, amendment 2026-09-26).
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
-nats = { package = "xmip-core-transport-nats", git = "https://github.com/IlleNilsson/xmip-core-transport-nats", branch = "main" }
-serde_json = "1"
+# The wire, and the `name` setting both declare (`nats::declaration::NAME`):
+# its declaration alone where this crate is.
+nats = { package = "xmip-core-transport-nats", git = "https://github.com/IlleNilsson/xmip-core-transport-nats", branch = "main", default-features = false }
+serde_json = { version = "1", optional = true }
 # The inbox this connection listens on is named from random bytes, spelled
 # in hex (codec's `random` and `hex`).
-codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main" }
+codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main", optional = true }
+
+[features]
+# The technology: its code, everything it is built on, and its declaration.
+# Without it the crate is its declaration alone (ADR-0064, amendments
+# 2026-10-22 and 2026-11-26).
+default = ["declaration", "nats/default", "dep:net", "dep:serde_json", "dep:codec"]
+# The declaration alone: what a Location of this technology is configured
+# with, `declaration::SETTINGS` and `SCHEMES`, the nats technology's `name`
+# among them, and none of the code — what the surfaces' library is to carry
+# (open problem 48).
+declaration = ["nats/declaration"]
 
 # The module's timing program (doc/governance/rust-style.md section 5c): a
 # plain cargo test leaves it out, and the landing runs it after every other

@@ -26,35 +26,50 @@
 //! `nats-jetstream://server/orders/orders.new?seq=42`. A send target is
 //! `nats-jetstream://host:4222/orders.new`, `host:4222/orders.new`, or a
 //! subject alone on the configured server.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, the nats
+//! technology's `name` among it, and none of the code above, which is
+//! behind the default feature: what the surfaces' library carries
+//! (ADR-0064, amendment 2026-11-26).
 
+#[cfg(feature = "default")]
 pub mod api;
+#[cfg(feature = "default")]
 pub mod client;
+#[cfg(feature = "declaration")]
+pub mod declaration;
+#[cfg(feature = "default")]
 pub mod session;
 
+#[cfg(feature = "default")]
 use std::net::TcpListener;
+#[cfg(feature = "default")]
 use std::time::Duration;
 
+#[cfg(feature = "default")]
 pub use client::{JetStream, Pulled};
+#[cfg(feature = "default")]
+use declaration::{DEFAULT_BATCH, DEFAULT_CONSUMER};
+#[cfg(feature = "default")]
 use net::Target;
+#[cfg(feature = "default")]
 pub use session::{Event, Session};
-use transport::ArrivalIdentity;
-use transport::destination;
-use transport::error::TransportError;
-use transport::error::{Result, protocol_error};
+#[cfg(feature = "default")]
+use transport::error::{Result, TransportError, protocol_error};
+#[cfg(feature = "default")]
 use transport::listening::{Accepting, Listening};
+#[cfg(feature = "default")]
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
-use transport::socket;
+#[cfg(feature = "default")]
 use transport::{
-    Acknowledgement, Arrived, Configured, Directions, Pool, Taken, Transport, Verdict,
+    Acknowledgement, ArrivalIdentity, Arrived, Configured, Directions, Pool, Taken, Transport,
+    Verdict, destination, socket,
 };
-use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+#[cfg(feature = "default")]
+use xcore::settings::{Read, Settings};
 
-/// The durable consumer a Location pulls as unless told otherwise.
-const DEFAULT_CONSUMER: &str = "xmip";
-
-/// How many messages one receive pulls at most unless told otherwise.
-const DEFAULT_BATCH: usize = 10;
-
+#[cfg(feature = "default")]
 #[derive(Clone)]
 pub struct JetStreamTransport {
     server: String,
@@ -72,6 +87,7 @@ pub struct JetStreamTransport {
     consumers: Pool<JetStream>,
 }
 
+#[cfg(feature = "default")]
 impl JetStreamTransport {
     /// Speak to the server at `server` about `stream`, which covers
     /// `subject`. The consumer is `xmip` until named.
@@ -86,7 +102,7 @@ impl JetStreamTransport {
             stream: stream.into(),
             subject: subject.into(),
             consumer: DEFAULT_CONSUMER.to_string(),
-            name: nats::DEFAULT_NAME.to_string(),
+            name: nats::declaration::DEFAULT_NAME.to_string(),
             batch: DEFAULT_BATCH,
             timeout: None,
             publishers: Pool::new(),
@@ -150,6 +166,7 @@ impl JetStreamTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Transport for JetStreamTransport {
     fn name(&self) -> &'static str {
         "nats-jetstream"
@@ -211,6 +228,7 @@ impl Transport for JetStreamTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl JetStreamTransport {
     /// The one send, on the publisher kept for the target's server.
     fn publish(&self, target: &str, bytes: &[u8], key: Option<&str>) -> Result<()> {
@@ -231,6 +249,7 @@ impl JetStreamTransport {
 /// flushed — one PING and PONG. Where the
 /// server closed that connection meanwhile none is opened: the server
 /// delivers again, after the consumer's ack wait, what was not answered.
+#[cfg(feature = "default")]
 fn answering(consumers: &Pool<JetStream>, server: &str, ack_subject: String) -> Acknowledgement {
     let consumers = consumers.clone();
     let server = server.to_string();
@@ -248,64 +267,10 @@ fn answering(consumers: &Pool<JetStream>, server: &str, ack_subject: String) -> 
     })
 }
 
+#[cfg(feature = "default")]
 impl Configured for JetStreamTransport {
-    /// The address is the server's host and port: where a Location connects.
-    // DEFAULT_BATCH is ten, which no pointer width wraps.
-    #[allow(clippy::cast_possible_wrap)]
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[
-            Setting {
-                name: "stream",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The stream a Receive Location makes sure of and pulls from.",
-                applies: Applies::Receive,
-            },
-            Setting {
-                name: "subject",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The subject the stream covers, and the one a Send Location \
-                          publishes on when its target names none.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "consumer",
-                kind: Kind::Text,
-                presence: Presence::Default(Fixed::Text(DEFAULT_CONSUMER)),
-                meaning: "The durable consumer a Receive Location pulls as; two Locations \
-                          with one name share one place in the stream.",
-                applies: Applies::Receive,
-            },
-            Setting {
-                name: "batch",
-                kind: Kind::Integer {
-                    minimum: 1,
-                    maximum: u32::MAX as i64,
-                },
-                presence: Presence::Default(Fixed::Integer(DEFAULT_BATCH as i64)),
-                meaning: "How many messages one receive pulls at most.",
-                applies: Applies::Receive,
-            },
-            Setting {
-                name: "name",
-                kind: Kind::Text,
-                presence: Presence::Default(Fixed::Text(nats::DEFAULT_NAME)),
-                meaning: "The name a Location presents to the server in CONNECT.",
-                applies: Applies::Both,
-            },
-            transport::configured::timeout(
-                Applies::Both,
-                None,
-                "How long a server that stops mid-line is waited on, and how long \
-                 a quiet server ends a batch; unbounded when left out.",
-            ),
-        ],
-    };
-
-    /// The schemes a Location's address is entered with to choose this technology.
-    const SCHEMES: &'static [&'static str] = &["nats-jetstream"];
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
 
     /// The subject setting: the address names only the server.
     fn own_target(_address: &str) -> &str {
@@ -335,6 +300,7 @@ impl Configured for JetStreamTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl JetStreamTransport {
     /// Both ends on this machine: an ephemeral local port, the loopback
     /// timeout, one stream called `probe` over one subject called `probe`.
@@ -344,6 +310,7 @@ impl JetStreamTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Accepting for JetStreamTransport {
     fn take_one(self, listener: &TcpListener) -> Result<Taken> {
         let mut session = self.accept_one(listener)?;
@@ -355,6 +322,7 @@ impl Accepting for JetStreamTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Loopback for JetStreamTransport {
     fn arrival_identity(&self) -> ArrivalIdentity {
         ArrivalIdentity::Unnamed(
@@ -381,6 +349,7 @@ impl Loopback for JetStreamTransport {
 mod tests {
     use super::*;
     use transport::payload::{edge_payloads, sized_payloads};
+    use xcore::settings::Applies;
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
