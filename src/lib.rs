@@ -28,10 +28,7 @@
 //! subject alone on the configured server.
 //!
 //! **Built with its `declaration` feature alone** the crate is
-//! [`declaration`], what a Location of it is configured with, the nats
-//! technology's `name` among it, and none of the code above, which is
-//! behind the default feature: what the surfaces' library carries
-//! (ADR-0064, amendment 2026-11-26).
+//! [`declaration`], the nats technology's `name` among it.
 
 #[cfg(feature = "default")]
 pub mod api;

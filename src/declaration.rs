@@ -1,11 +1,8 @@
-//! What a Location of this technology is configured with: its declaration,
-//! which `Configured` reads, built with the crate's `declaration` feature
-//! alone and the code behind the default (ADR-0064, amendments 2026-10-22
-//! and 2026-11-26), for the library the surfaces load to carry (open
-//! problem 48). `name` is the nats technology's, taken by that crate's own
-//! `declaration` feature; the consumer and the batch a Location takes
-//! unless told otherwise are declared here, and the code takes them from
-//! here.
+//! This technology's declaration: the transport guide's "The declaration",
+//! `module/core/capability/transport/doc/adding-a-transport.md`. `name` is
+//! the nats technology's, taken by that crate's own `declaration` feature;
+//! the consumer and the batch a Location takes unless told otherwise are
+//! declared here, and the code takes them from here.
 
 use xcore::settings::{Applies, Fixed, Kind, Presence, Setting, Settings};
 
@@ -65,5 +62,6 @@ pub const SETTINGS: &Settings = &Settings {
     ],
 };
 
-/// The schemes a Location's address is entered with to choose this technology.
+/// This technology's schemes, as [`transport::Configured::SCHEMES`] defines
+/// them.
 pub const SCHEMES: &[&str] = &["nats-jetstream"];

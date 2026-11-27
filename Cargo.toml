@@ -31,14 +31,10 @@ serde_json = { version = "1", optional = true }
 codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main", optional = true }
 
 [features]
-# The technology: its code, everything it is built on, and its declaration.
-# Without it the crate is its declaration alone (ADR-0064, amendments
-# 2026-10-22 and 2026-11-26).
+# The code and its declaration: the transport guide's "The declaration",
+# module/core/capability/transport/doc/adding-a-transport.md.
 default = ["declaration", "nats/default", "dep:net", "dep:serde_json", "dep:codec"]
-# The declaration alone: what a Location of this technology is configured
-# with, `declaration::SETTINGS` and `SCHEMES`, the nats technology's `name`
-# among them, and none of the code — what the surfaces' library is to carry
-# (open problem 48).
+# The declaration alone, the nats technology's `name` among its settings.
 declaration = ["nats/declaration"]
 
 # The module's timing program (doc/governance/rust-style.md section 5c): a
